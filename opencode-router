@@ -1,0 +1,926 @@
+#!/usr/bin/env sh
+set -eu
+
+# Explicit routed OpenCode entrypoint.
+#
+# This command picks a profile when needed,
+# then runs the real OpenCode binary with profile-specific env vars.
+
+NL=$(printf '\nx'); NL=${NL%x}
+CR=$(printf '\rx'); CR=${CR%x}
+PROFILE_DATA_BASE="$HOME/.local/opencode-profiles"
+CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+
+# If the router is invoked from an already-profiled environment, normalize these
+# roots back to the user's base XDG locations before resolving router metadata.
+case "$CONFIG_HOME" in
+  */opencode-router/profiles/*/config) CONFIG_HOME="$HOME/.config" ;;
+esac
+case "$DATA_HOME" in
+  "$PROFILE_DATA_BASE"/*/share) DATA_HOME="$HOME/.local/share" ;;
+esac
+case "$STATE_HOME" in
+  "$PROFILE_DATA_BASE"/*/state) STATE_HOME="$HOME/.local/state" ;;
+esac
+
+ROUTER_HOME="$CONFIG_HOME/opencode-router"
+PROFILES_DIR="$ROUTER_HOME/profiles"
+
+# Print top-level CLI usage.
+usage() {
+  cat <<'EOF'
+Usage:
+  opencode-router [opencode args...]
+  opencode-router run [opencode args...]
+  opencode-router profile <name|default> [opencode args...]
+  opencode-router which [--verbose] [opencode args...]
+  opencode-router new [name] [path] [--description TEXT] [--use-state] [--full-config-isolation] [--no-config] [--force]
+  opencode-router list
+  opencode-router show <name|default> [--config|--config-file|--data|--profile-file]
+  opencode-router remove <name> [--dry-run|--yes]
+  opencode-router remove --prune [--dry-run|--yes]
+  opencode-router remove --all [--dry-run|--yes]
+  opencode-router help
+
+Notes:
+  - `opencode` stays untouched.
+  - `opencode-router` is the explicit routed entrypoint.
+  - `show <name> --config` prints the profile config directory, so you can do:
+      cd "$(opencode-router show work --config)"
+EOF
+}
+
+# Print an error and exit with CLI-usage status.
+die() {
+  printf '%s\n' "$1" >&2
+  exit 2
+}
+
+# Resolve a directory to its physical absolute path.
+real_dir() {
+  (cd -- "${1:-.}" 2>/dev/null && pwd -P) || return 1
+}
+
+# Create the managed profile/config/data roots on demand.
+ensure_dirs() {
+  mkdir -p "$PROFILES_DIR" "$PROFILE_DATA_BASE"
+}
+
+# Return the env-file path for a profile name.
+profile_env_path() {
+  printf '%s/%s.env\n' "$PROFILES_DIR" "$1"
+}
+
+# Return the router-managed home for one profile.
+profile_home() {
+  printf '%s/%s\n' "$PROFILES_DIR" "$1"
+}
+
+# Return the profile-specific XDG config home.
+profile_config_home() {
+  printf '%s/config\n' "$(profile_home "$1")"
+}
+
+# Return the profile-specific OpenCode config directory.
+profile_config_dir() {
+  printf '%s/opencode\n' "$(profile_config_home "$1")"
+}
+
+# Return the main OpenCode config file for a profile name.
+profile_config_file() {
+  printf '%s/opencode.jsonc\n' "$(profile_config_dir "$1")"
+}
+
+# Return the managed data root for a profile name.
+profile_data_root() {
+  printf '%s/%s\n' "$PROFILE_DATA_BASE" "$1"
+}
+
+# Return the XDG data home that OpenCode should see for a profile.
+profile_data_home() {
+  printf '%s/share\n' "$(profile_data_root "$1")"
+}
+
+# Return the XDG state home that OpenCode should see for a profile.
+profile_state_home() {
+  printf '%s/state\n' "$(profile_data_root "$1")"
+}
+
+# Validate a profile name before it is used in managed paths.
+# `default` is reserved as a pseudo-profile that means plain OpenCode.
+profile_name_valid() {
+  case "$1" in
+    ''|default|.|..|-*|*/*|*"$NL"*|*"$CR"*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Quote one profile value for the router's line-based metadata file.
+# The file is parsed as data, never sourced as shell.
+quote_profile_value() {
+  QUOTE_INPUT=$1
+  case "$QUOTE_INPUT" in
+    *"$NL"*|*"$CR"*) die 'Profile metadata values must stay on one line' ;;
+  esac
+
+  QUOTE_OUTPUT='"'
+  while [ -n "$QUOTE_INPUT" ]; do
+    QUOTE_CHAR=${QUOTE_INPUT%"${QUOTE_INPUT#?}"}
+    QUOTE_INPUT=${QUOTE_INPUT#?}
+    case "$QUOTE_CHAR" in
+      '\\'|'"') QUOTE_OUTPUT=$QUOTE_OUTPUT\\$QUOTE_CHAR ;;
+      *) QUOTE_OUTPUT=$QUOTE_OUTPUT$QUOTE_CHAR ;;
+    esac
+  done
+  QUOTE_OUTPUT=$QUOTE_OUTPUT'"'
+  printf '%s\n' "$QUOTE_OUTPUT"
+}
+
+# Parse one profile value from the router's metadata file.
+# Only the router's simple quoted-string format is accepted here.
+parse_profile_value() {
+  PARSE_INPUT=$1
+  PARSE_FILE=$2
+
+  case "$PARSE_INPUT" in
+    \"*\")
+      PARSE_INPUT=${PARSE_INPUT#\"}
+      PARSE_INPUT=${PARSE_INPUT%\"}
+      PARSE_OUTPUT=''
+      PARSE_ESC=0
+      while [ -n "$PARSE_INPUT" ]; do
+        PARSE_CHAR=${PARSE_INPUT%"${PARSE_INPUT#?}"}
+        PARSE_INPUT=${PARSE_INPUT#?}
+        if [ "$PARSE_ESC" = '1' ]; then
+          case "$PARSE_CHAR" in
+            '\\'|'"') PARSE_OUTPUT=$PARSE_OUTPUT$PARSE_CHAR ;;
+            *) die "Invalid escape sequence in profile file: $PARSE_FILE" ;;
+          esac
+          PARSE_ESC=0
+          continue
+        fi
+
+        case "$PARSE_CHAR" in
+          '\\') PARSE_ESC=1 ;;
+          *) PARSE_OUTPUT=$PARSE_OUTPUT$PARSE_CHAR ;;
+        esac
+      done
+      [ "$PARSE_ESC" = '0' ] || die "Unterminated escape in profile file: $PARSE_FILE"
+      printf '%s\n' "$PARSE_OUTPUT"
+      ;;
+    \"*)
+      die "Unterminated quoted value in profile file: $PARSE_FILE"
+      ;;
+    *)
+      printf '%s\n' "$PARSE_INPUT"
+      ;;
+  esac
+}
+
+# Print configured profile names, sorted for stable output.
+list_profiles() {
+  if [ -d "$PROFILES_DIR" ]; then
+    for f in "$PROFILES_DIR"/*.env; do
+      [ -f "$f" ] || continue
+      basename "$f" .env
+    done | LC_ALL=C sort
+  fi
+}
+
+# Load one router-managed profile file into OCR_* variables.
+# This file is treated as data and parsed explicitly. It is never sourced.
+load_profile() {
+  LOAD_NAME=$1
+  profile_name_valid "$LOAD_NAME" || die "Invalid profile name: $LOAD_NAME"
+  LOAD_FILE=$(profile_env_path "$LOAD_NAME")
+  [ -f "$LOAD_FILE" ] || return 1
+
+  PROFILE_NAME=
+  PROFILE_DESCRIPTION=
+  PROFILE_MATCH_PREFIX=
+  PROFILE_USE_STATE=
+  PROFILE_FULL_CONFIG_ISOLATION=
+
+  while IFS= read -r LOAD_LINE || [ -n "$LOAD_LINE" ]; do
+    case "$LOAD_LINE" in
+      ''|'#'*) continue ;;
+    esac
+    case "$LOAD_LINE" in
+      *=*) ;;
+      *) die "Invalid profile file line in $LOAD_FILE: $LOAD_LINE" ;;
+    esac
+
+    LOAD_KEY=${LOAD_LINE%%=*}
+    LOAD_VALUE=$(parse_profile_value "${LOAD_LINE#*=}" "$LOAD_FILE")
+
+    case "$LOAD_KEY" in
+      PROFILE_NAME) PROFILE_NAME=$LOAD_VALUE ;;
+      PROFILE_DESCRIPTION) PROFILE_DESCRIPTION=$LOAD_VALUE ;;
+      PROFILE_MATCH_PREFIX) PROFILE_MATCH_PREFIX=$LOAD_VALUE ;;
+      PROFILE_USE_STATE)
+        case "$LOAD_VALUE" in
+          0|1) PROFILE_USE_STATE=$LOAD_VALUE ;;
+          *) die "Invalid PROFILE_USE_STATE in $LOAD_FILE: $LOAD_VALUE" ;;
+        esac
+        ;;
+      PROFILE_FULL_CONFIG_ISOLATION)
+        case "$LOAD_VALUE" in
+          0|1) PROFILE_FULL_CONFIG_ISOLATION=$LOAD_VALUE ;;
+          *) die "Invalid PROFILE_FULL_CONFIG_ISOLATION in $LOAD_FILE: $LOAD_VALUE" ;;
+        esac
+        ;;
+      *)
+        die "Unknown key in profile file $LOAD_FILE: $LOAD_KEY"
+        ;;
+    esac
+  done < "$LOAD_FILE"
+
+  if [ -n "$PROFILE_NAME" ] && [ "$PROFILE_NAME" != "$LOAD_NAME" ]; then
+    die "Profile name mismatch in $LOAD_FILE: expected $LOAD_NAME"
+  fi
+
+  OCR_NAME="$LOAD_NAME"
+  OCR_DESCRIPTION="${PROFILE_DESCRIPTION:-}"
+  OCR_MATCH_PREFIX="${PROFILE_MATCH_PREFIX:-}"
+  OCR_USE_STATE="${PROFILE_USE_STATE:-0}"
+  OCR_FULL_CONFIG_ISOLATION="${PROFILE_FULL_CONFIG_ISOLATION:-0}"
+  OCR_XDG_DATA_HOME=$(profile_data_home "$LOAD_NAME")
+  OCR_XDG_STATE_HOME=$(profile_state_home "$LOAD_NAME")
+  OCR_XDG_CONFIG_HOME=$(profile_config_home "$LOAD_NAME")
+  OCR_OPENCODE_CONFIG=$(profile_config_file "$LOAD_NAME")
+  OCR_FILE="$LOAD_FILE"
+}
+
+# Return the config directory for the loaded profile.
+# This is always the router-managed directory derived from the profile name.
+loaded_config_dir() {
+  profile_config_dir "$OCR_NAME"
+}
+
+# Return the config home root for the loaded profile.
+# This is always the router-managed config home derived from the profile name.
+loaded_config_home() {
+  profile_config_home "$OCR_NAME"
+}
+
+# Return the data root for the loaded profile.
+# This is always the router-managed data root derived from the profile name.
+loaded_data_root() {
+  profile_data_root "$OCR_NAME"
+}
+
+# Return the default OpenCode config directory when no router profile is active.
+default_config_dir() {
+  printf '%s/opencode\n' "$CONFIG_HOME"
+}
+
+# Return the default OpenCode config file when no router profile is active.
+default_config_file() {
+  printf '%s/opencode.jsonc\n' "$(default_config_dir)"
+}
+
+# Extract `--dir VALUE` or `--dir=VALUE` from OpenCode args.
+# Stop at `--` so prompt text like `--dir foo` is not treated as routing input.
+find_dir_flag() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --) return 1 ;;
+      --dir)
+        shift
+        [ "$#" -gt 0 ] || return 1
+        printf '%s\n' "$1"
+        return 0
+        ;;
+      --dir=*)
+        printf '%s\n' "${1#--dir=}"
+        return 0
+        ;;
+    esac
+    shift
+  done
+  return 1
+}
+
+# Return success when the first arg is a real OpenCode subcommand.
+# This keeps routing close to OpenCode's own CLI behavior instead of treating
+# every existing directory-like positional arg as a project target.
+is_opencode_command() {
+  case "$1" in
+    acp|agent|attach|completion|console|db|debug|export|generate|github|import|mcp|models|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Infer which directory should drive routing for this invocation.
+target_dir() {
+  # Route by the directory OpenCode is about to act on, not only by $PWD.
+  TARGET_CWD=$(real_dir "$PWD") || TARGET_CWD=$PWD
+  TARGET_FLAG=$(find_dir_flag "$@") || TARGET_FLAG=''
+  if [ -n "$TARGET_FLAG" ]; then
+    if [ -d "$TARGET_FLAG" ]; then
+      real_dir "$TARGET_FLAG" || printf '%s\n' "$TARGET_FLAG"
+    else
+      # OpenCode passes some non-local `--dir` values through for remote flows.
+      printf '%s\n' "$TARGET_FLAG"
+    fi
+    return 0
+  fi
+
+  TARGET_FIRST=${1-}
+  TARGET_SECOND=${2-}
+
+  case "$TARGET_FIRST" in
+    ''|-*)
+      printf '%s\n' "$TARGET_CWD"
+      ;;
+    tui)
+      # Keep legacy support for older `opencode tui <dir>` forms.
+      if [ -n "$TARGET_SECOND" ] && [ "${TARGET_SECOND#-}" = "$TARGET_SECOND" ] && [ -d "$TARGET_SECOND" ]; then
+        real_dir "$TARGET_SECOND" || printf '%s\n' "$TARGET_SECOND"
+      else
+        printf '%s\n' "$TARGET_CWD"
+      fi
+      ;;
+    *)
+      if is_opencode_command "$TARGET_FIRST"; then
+        printf '%s\n' "$TARGET_CWD"
+      elif [ -d "$TARGET_FIRST" ]; then
+        real_dir "$TARGET_FIRST" || printf '%s\n' "$TARGET_CWD"
+      else
+        printf '%s\n' "$TARGET_CWD"
+      fi
+      ;;
+  esac
+}
+
+# Pick the profile whose match path is the longest prefix of the target dir.
+match_profile() {
+  MATCH_TARGET=$(target_dir "$@")
+  MATCH_NAME=''
+  MATCH_LEN=0
+  MATCH_LIST=$(list_profiles)
+
+  # Longest-prefix wins so nested paths can override broader parent paths.
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    load_profile "$name" || continue
+    MATCH_PREFIX=$OCR_MATCH_PREFIX
+    [ -n "$MATCH_PREFIX" ] || continue
+    if [ -d "$MATCH_PREFIX" ]; then
+      MATCH_PREFIX=$(real_dir "$MATCH_PREFIX" || printf '%s\n' "$MATCH_PREFIX")
+    fi
+    case "$MATCH_TARGET/" in
+      "$MATCH_PREFIX"/*)
+        MATCH_THIS_LEN=${#MATCH_PREFIX}
+        if [ "$MATCH_THIS_LEN" -gt "$MATCH_LEN" ]; then
+          MATCH_LEN=$MATCH_THIS_LEN
+          MATCH_NAME=$name
+        fi
+        ;;
+    esac
+  done <<EOF
+$MATCH_LIST
+EOF
+
+  printf '%s\n' "$MATCH_NAME"
+}
+
+# Run plain OpenCode without any profile overrides.
+run_default() {
+  exec opencode "$@"
+}
+
+# Run plain OpenCode while dropping router-managed overrides from the parent env.
+# This is used by the explicit `profile default` escape hatch.
+run_default_forced() {
+  (
+    case "${XDG_DATA_HOME-}" in
+      "$PROFILE_DATA_BASE"/*/share) unset XDG_DATA_HOME ;;
+    esac
+    case "${XDG_STATE_HOME-}" in
+      "$PROFILE_DATA_BASE"/*/state) unset XDG_STATE_HOME ;;
+    esac
+    case "${XDG_CONFIG_HOME-}" in
+      */opencode-router/profiles/*/config) unset XDG_CONFIG_HOME ;;
+    esac
+    case "${OPENCODE_CONFIG-}" in
+      */opencode-router/profiles/*/config/opencode/opencode.jsonc) unset OPENCODE_CONFIG ;;
+    esac
+    case "${OPENCODE_CONFIG_DIR-}" in
+      */opencode-router/profiles/*/config/opencode) unset OPENCODE_CONFIG_DIR ;;
+    esac
+    exec opencode "$@"
+  )
+}
+
+# Run OpenCode with one profile's env overrides.
+run_profile() {
+  RUN_PROFILE_NAME=$1
+  shift
+
+  # `default` is a pseudo-profile that means plain OpenCode with no router overrides.
+  if [ "$RUN_PROFILE_NAME" = 'default' ]; then
+    run_default_forced "$@"
+    return 0
+  fi
+
+  load_profile "$RUN_PROFILE_NAME" || {
+    printf 'Unknown profile: %s\n' "$RUN_PROFILE_NAME" >&2
+    printf 'Available profiles:\n' >&2
+    RUN_LIST=$(list_profiles)
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      printf '  - %s\n' "$name" >&2
+    done <<EOF
+$RUN_LIST
+EOF
+    exit 2
+  }
+
+  (
+    # Keep profile-specific env changes scoped to this one OpenCode process.
+    # Managed paths are derived from the profile name, not trusted from file data.
+    [ -n "$OCR_XDG_DATA_HOME" ] && export XDG_DATA_HOME="$OCR_XDG_DATA_HOME"
+    if [ "$OCR_USE_STATE" != "0" ] && [ -n "$OCR_XDG_STATE_HOME" ]; then
+      export XDG_STATE_HOME="$OCR_XDG_STATE_HOME"
+    fi
+    if [ "$OCR_FULL_CONFIG_ISOLATION" != "0" ] && [ -n "$OCR_XDG_CONFIG_HOME" ]; then
+      export XDG_CONFIG_HOME="$OCR_XDG_CONFIG_HOME"
+      unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
+    elif [ -f "$OCR_OPENCODE_CONFIG" ] || [ -d "$(loaded_config_dir)" ]; then
+      export OPENCODE_CONFIG_DIR="$(loaded_config_dir)"
+      if [ -f "$OCR_OPENCODE_CONFIG" ]; then
+        export OPENCODE_CONFIG="$OCR_OPENCODE_CONFIG"
+      else
+        unset OPENCODE_CONFIG
+      fi
+    else
+      unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
+    fi
+    exec opencode "$@"
+  )
+}
+
+# Auto-select a profile, then dispatch to profiled or default OpenCode.
+run_auto() {
+  RUN_SELECTED=$(match_profile "$@")
+  if [ -n "$RUN_SELECTED" ]; then
+    run_profile "$RUN_SELECTED" "$@"
+  else
+    run_default "$@"
+  fi
+}
+
+# Print the currently loaded profile in a user-facing format.
+print_loaded_profile() {
+  printf 'name: %s\n' "$OCR_NAME"
+  [ -n "$OCR_DESCRIPTION" ] && printf 'description: %s\n' "$OCR_DESCRIPTION"
+  if [ -n "$OCR_MATCH_PREFIX" ]; then
+    printf 'match-path: %s\n' "$OCR_MATCH_PREFIX"
+  else
+    printf 'match-path: <none>\n'
+  fi
+  printf 'profile-file: %s\n' "$OCR_FILE"
+  printf 'full-config-isolation: %s\n' "$OCR_FULL_CONFIG_ISOLATION"
+  printf 'config-home: %s\n' "$(loaded_config_home)"
+  printf 'config-dir: %s\n' "$(loaded_config_dir)"
+  printf 'config-file: %s\n' "$OCR_OPENCODE_CONFIG"
+  if [ -f "$OCR_OPENCODE_CONFIG" ]; then
+    printf 'config-file-exists: yes\n'
+  else
+    printf 'config-file-exists: no\n'
+  fi
+  printf 'data-root: %s\n' "$(loaded_data_root)"
+  printf 'XDG_DATA_HOME: %s\n' "$OCR_XDG_DATA_HOME"
+  if [ "$OCR_USE_STATE" != "0" ] && [ -n "$OCR_XDG_STATE_HOME" ]; then
+    printf 'XDG_STATE_HOME: %s\n' "$OCR_XDG_STATE_HOME"
+  else
+    printf 'XDG_STATE_HOME: <unchanged>\n'
+  fi
+  if [ "$OCR_FULL_CONFIG_ISOLATION" != "0" ] && [ -n "$OCR_XDG_CONFIG_HOME" ]; then
+    printf 'XDG_CONFIG_HOME: %s\n' "$OCR_XDG_CONFIG_HOME"
+    printf 'OPENCODE_CONFIG: <handled by isolated XDG config>\n'
+    printf 'OPENCODE_CONFIG_DIR: <handled by isolated XDG config>\n'
+  elif [ -f "$OCR_OPENCODE_CONFIG" ] || [ -d "$(loaded_config_dir)" ]; then
+    printf 'XDG_CONFIG_HOME: <unchanged>\n'
+    if [ -f "$OCR_OPENCODE_CONFIG" ]; then
+      printf 'OPENCODE_CONFIG: %s\n' "$OCR_OPENCODE_CONFIG"
+    else
+      printf 'OPENCODE_CONFIG: <unset; config file missing>\n'
+    fi
+    printf 'OPENCODE_CONFIG_DIR: %s\n' "$(loaded_config_dir)"
+  else
+    printf 'XDG_CONFIG_HOME: <unchanged>\n'
+    printf 'OPENCODE_CONFIG: <unset; no profile config files>\n'
+    printf 'OPENCODE_CONFIG_DIR: <unset; no profile config dir>\n'
+  fi
+}
+
+# Print the plain OpenCode view used when no router profile is active.
+print_default_profile() {
+  DEFAULT_CONFIG_DIR=$(default_config_dir)
+  DEFAULT_CONFIG_FILE=$(default_config_file)
+  printf 'name: default\n'
+  printf 'description: <plain opencode>\n'
+  printf 'match-path: <none>\n'
+  printf 'profile-file: <none>\n'
+  printf 'full-config-isolation: 0\n'
+  printf 'config-home: %s\n' "$CONFIG_HOME"
+  printf 'config-dir: %s\n' "$DEFAULT_CONFIG_DIR"
+  printf 'config-file: %s\n' "$DEFAULT_CONFIG_FILE"
+  if [ -f "$DEFAULT_CONFIG_FILE" ]; then
+    printf 'config-file-exists: yes\n'
+  else
+    printf 'config-file-exists: no\n'
+  fi
+  printf 'data-root: %s\n' "$DATA_HOME"
+  printf 'XDG_DATA_HOME: <unchanged> %s\n' "$DATA_HOME"
+  printf 'XDG_STATE_HOME: <unchanged> %s\n' "$STATE_HOME"
+  printf 'XDG_CONFIG_HOME: <unchanged> %s\n' "$CONFIG_HOME"
+  printf 'OPENCODE_CONFIG: <unchanged by router>\n'
+  printf 'OPENCODE_CONFIG_DIR: <unchanged by router>\n'
+}
+
+# Prompt interactively for a missing value when `new` is used without args.
+prompt_value() {
+  PROMPT_LABEL=$1
+  PROMPT_DEFAULT=${2-}
+  [ -t 0 ] || die "Missing required argument: $PROMPT_LABEL"
+  if [ -n "$PROMPT_DEFAULT" ]; then
+    printf '%s [%s]: ' "$PROMPT_LABEL" "$PROMPT_DEFAULT" >&2
+  else
+    printf '%s: ' "$PROMPT_LABEL" >&2
+  fi
+  IFS= read -r PROMPT_VALUE || exit 1
+  if [ -z "$PROMPT_VALUE" ]; then
+    PROMPT_VALUE=$PROMPT_DEFAULT
+  fi
+  printf '%s\n' "$PROMPT_VALUE"
+}
+
+# Prompt for a yes/no answer in interactive helper mode.
+prompt_yes_no() {
+  PROMPT_LABEL=$1
+  PROMPT_DEFAULT=${2:-n}
+  [ -t 0 ] || die "Missing required interactive answer: $PROMPT_LABEL"
+  case "$PROMPT_DEFAULT" in
+    y|Y) printf '%s [Y/n]: ' "$PROMPT_LABEL" >&2 ;;
+    *) printf '%s [y/N]: ' "$PROMPT_LABEL" >&2 ;;
+  esac
+  IFS= read -r PROMPT_REPLY || exit 1
+  case "$PROMPT_REPLY" in
+    '') PROMPT_REPLY=$PROMPT_DEFAULT ;;
+  esac
+  case "$PROMPT_REPLY" in
+    y|Y|yes|YES) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+# Remove one path, or preview the removal in dry-run mode.
+remove_path() {
+  REMOVE_PATH=$1
+  REMOVE_APPLY=$2
+  [ -n "$REMOVE_PATH" ] || die 'Refusing to remove an empty path'
+  [ "$REMOVE_PATH" != '/' ] || die 'Refusing to remove /'
+  [ -e "$REMOVE_PATH" ] || return 0
+  if [ "$REMOVE_APPLY" = "1" ]; then
+    rm -rf -- "$REMOVE_PATH"
+    printf 'removed: %s\n' "$REMOVE_PATH"
+  else
+    printf '[dry-run] would remove: %s\n' "$REMOVE_PATH"
+  fi
+}
+
+# Explain what routing would do for a given OpenCode invocation.
+cmd_which() {
+  WHICH_VERBOSE=0
+  if [ "${1-}" = "--verbose" ]; then
+    WHICH_VERBOSE=1
+    shift
+  fi
+
+  WHICH_TARGET=$(target_dir "$@")
+  WHICH_SELECTED=$(match_profile "$@")
+  if [ "$WHICH_VERBOSE" != '1' ]; then
+    if [ -n "$WHICH_SELECTED" ]; then
+      printf '%s\n' "$WHICH_SELECTED"
+    else
+      printf 'default\n'
+    fi
+    return 0
+  fi
+
+  printf 'target-dir: %s\n' "$WHICH_TARGET"
+  if [ -z "$WHICH_SELECTED" ]; then
+    WHICH_AUTH_FILE="$DATA_HOME/opencode/auth.json"
+    print_default_profile
+  else
+    load_profile "$WHICH_SELECTED" || exit 1
+    WHICH_AUTH_FILE="$OCR_XDG_DATA_HOME/opencode/auth.json"
+    print_loaded_profile
+  fi
+  printf 'expected-auth-file: %s\n' "$WHICH_AUTH_FILE"
+  if [ -f "$WHICH_AUTH_FILE" ]; then
+    printf 'expected-auth-file-exists: yes\n'
+  else
+    printf 'expected-auth-file-exists: no\n'
+  fi
+}
+
+# Create a new profile, either from args or by prompting the user.
+cmd_new() {
+  NEW_NAME=''
+  NEW_PATH=''
+  if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    NEW_NAME=$1
+    shift
+  fi
+  if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    NEW_PATH=$1
+    shift
+  fi
+  NEW_DESCRIPTION=''
+  NEW_DESCRIPTION_SET=0
+  NEW_USE_STATE=0
+  NEW_USE_STATE_SET=0
+  NEW_FULL_CONFIG_ISOLATION=0
+  NEW_FULL_CONFIG_ISOLATION_SET=0
+  NEW_WRITE_CONFIG=1
+  NEW_WRITE_CONFIG_SET=0
+  NEW_FORCE=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --description)
+        shift
+        [ "$#" -gt 0 ] || die 'Missing value for --description'
+        NEW_DESCRIPTION=$1
+        NEW_DESCRIPTION_SET=1
+        ;;
+      --use-state)
+        NEW_USE_STATE=1
+        NEW_USE_STATE_SET=1
+        ;;
+      --full-config-isolation)
+        NEW_FULL_CONFIG_ISOLATION=1
+        NEW_FULL_CONFIG_ISOLATION_SET=1
+        ;;
+      --no-config)
+        NEW_WRITE_CONFIG=0
+        NEW_WRITE_CONFIG_SET=1
+        ;;
+      --force) NEW_FORCE=1 ;;
+      *) die "Unknown new flag: $1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$NEW_NAME" ] || NEW_NAME=$(prompt_value 'Profile name')
+  if [ -t 0 ] && [ -z "$NEW_PATH" ]; then
+    NEW_PATH=$(prompt_value 'Match path (optional, blank disables auto-selection)')
+  fi
+
+  profile_name_valid "$NEW_NAME" || die "Invalid profile name: $NEW_NAME"
+
+  if [ -n "$NEW_PATH" ]; then
+    NEW_PATH=$(real_dir "$NEW_PATH") || die "Path does not exist: $NEW_PATH"
+  fi
+  if [ -t 0 ] && [ "$NEW_DESCRIPTION_SET" = '0' ]; then
+    NEW_DESCRIPTION=$(prompt_value 'Description' "$NEW_NAME profile")
+  elif [ -z "$NEW_DESCRIPTION" ]; then
+    NEW_DESCRIPTION="$NEW_NAME profile"
+  fi
+  if [ -t 0 ] && [ "$NEW_USE_STATE_SET" = '0' ]; then
+    NEW_USE_STATE=$(prompt_yes_no 'Isolate XDG_STATE_HOME too?' n)
+  fi
+  if [ -t 0 ] && [ "$NEW_FULL_CONFIG_ISOLATION_SET" = '0' ]; then
+    NEW_FULL_CONFIG_ISOLATION=$(prompt_yes_no 'Full config isolation? This profile will not inherit global agents, skills, or other shared OpenCode config.' n)
+  fi
+  if [ -t 0 ] && [ "$NEW_WRITE_CONFIG_SET" = '0' ]; then
+    NEW_WRITE_CONFIG=$(prompt_yes_no 'Create profile config files now?' y)
+  fi
+
+  ensure_dirs
+  NEW_ENV_FILE=$(profile_env_path "$NEW_NAME")
+  NEW_CONFIG_HOME=$(profile_config_home "$NEW_NAME")
+  NEW_CONFIG_DIR=$(profile_config_dir "$NEW_NAME")
+  NEW_CONFIG_FILE=$(profile_config_file "$NEW_NAME")
+  NEW_DATA_ROOT=$(profile_data_root "$NEW_NAME")
+  NEW_DATA_HOME=$(profile_data_home "$NEW_NAME")
+  NEW_STATE_HOME=$(profile_state_home "$NEW_NAME")
+
+  if [ -f "$NEW_ENV_FILE" ] && [ "$NEW_FORCE" != '1' ]; then
+    die "Profile already exists: $NEW_ENV_FILE"
+  fi
+
+  # The profile file is strict router metadata, not executable shell.
+  cat > "$NEW_ENV_FILE" <<EOF
+PROFILE_NAME=$(quote_profile_value "$NEW_NAME")
+PROFILE_DESCRIPTION=$(quote_profile_value "$NEW_DESCRIPTION")
+PROFILE_MATCH_PREFIX=$(quote_profile_value "$NEW_PATH")
+PROFILE_USE_STATE=$NEW_USE_STATE
+PROFILE_FULL_CONFIG_ISOLATION=$NEW_FULL_CONFIG_ISOLATION
+EOF
+
+  mkdir -p "$NEW_DATA_HOME"
+  if [ "$NEW_USE_STATE" = '1' ]; then
+    mkdir -p "$NEW_STATE_HOME"
+  fi
+
+  if [ "$NEW_WRITE_CONFIG" = '1' ]; then
+    mkdir -p "$NEW_CONFIG_DIR"
+    if [ ! -f "$NEW_CONFIG_FILE" ] || [ "$NEW_FORCE" = '1' ]; then
+      cat > "$NEW_CONFIG_FILE" <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json"
+}
+EOF
+    fi
+  fi
+
+  printf 'created profile: %s\n' "$NEW_NAME"
+  if [ -n "$NEW_PATH" ]; then
+    printf '  match-path: %s\n' "$NEW_PATH"
+  else
+    printf '  match-path: <none; use `opencode-router profile %s ...` to force it>\n' "$NEW_NAME"
+  fi
+  printf '  profile-file: %s\n' "$NEW_ENV_FILE"
+  printf '  full-config-isolation: %s\n' "$NEW_FULL_CONFIG_ISOLATION"
+  printf '  data-root: %s\n' "$NEW_DATA_ROOT"
+  printf '  config-home: %s\n' "$NEW_CONFIG_HOME"
+  printf '  config-dir: %s\n' "$NEW_CONFIG_DIR"
+}
+
+# List configured profile names.
+cmd_list() {
+  [ "$#" -eq 0 ] || die 'Usage: opencode-router list'
+  LIST_EMPTY=1
+  LIST_NAMES=$(list_profiles)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    LIST_EMPTY=0
+    printf '%s\n' "$name"
+  done <<EOF
+$LIST_NAMES
+EOF
+  if [ "$LIST_EMPTY" = '1' ]; then
+    printf 'No profiles configured.\n'
+  fi
+}
+
+# Show one profile with its resolved paths, or print one specific path field.
+cmd_show() {
+  [ "$#" -ge 1 ] || die 'Usage: opencode-router show <name|default> [--config|--config-file|--data|--profile-file]'
+  SHOW_NAME=$1
+  shift
+  SHOW_MODE=full
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --config|--config-file|--data|--profile-file)
+        [ "$SHOW_MODE" = 'full' ] || die 'Use only one show flag at a time'
+        SHOW_MODE=${1#--}
+        ;;
+      *) die "Unknown show flag: $1" ;;
+    esac
+    shift
+  done
+
+  if [ "$SHOW_NAME" = 'default' ]; then
+    case "$SHOW_MODE" in
+      full) print_default_profile ;;
+      config) default_config_dir ;;
+      config-file) default_config_file ;;
+      data) printf '%s\n' "$DATA_HOME" ;;
+      profile-file) printf '<none>\n' ;;
+    esac
+    return 0
+  fi
+
+  load_profile "$SHOW_NAME" || die "Unknown profile: $SHOW_NAME"
+  case "$SHOW_MODE" in
+    full) print_loaded_profile ;;
+    config) loaded_config_dir ;;
+    config-file) printf '%s\n' "$OCR_OPENCODE_CONFIG" ;;
+    data) loaded_data_root ;;
+    profile-file) printf '%s\n' "$OCR_FILE" ;;
+  esac
+}
+
+# Remove stale managed directories with no matching profile env file.
+remove_stale() {
+  STALE_APPLY=$1
+  if [ -d "$PROFILES_DIR" ]; then
+    for path in "$PROFILES_DIR"/*; do
+      [ -d "$path" ] || continue
+      name=$(basename "$path")
+      if [ ! -f "$(profile_env_path "$name")" ]; then
+        remove_path "$path" "$STALE_APPLY"
+      fi
+    done
+  fi
+
+  if [ -d "$PROFILE_DATA_BASE" ]; then
+    for path in "$PROFILE_DATA_BASE"/*; do
+      [ -e "$path" ] || continue
+      name=$(basename "$path")
+      if [ ! -f "$(profile_env_path "$name")" ]; then
+        remove_path "$path" "$STALE_APPLY"
+      fi
+    done
+  fi
+}
+
+# Remove one profile, or wipe all managed router data with `--all`.
+# Deletion stays inside router-managed roots derived from the profile name.
+cmd_remove() {
+  REMOVE_NAME=''
+  REMOVE_ALL=0
+  REMOVE_PRUNE=0
+  REMOVE_APPLY=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all) REMOVE_ALL=1 ;;
+      --prune) REMOVE_PRUNE=1 ;;
+      --yes|--force) REMOVE_APPLY=1 ;;
+      --dry-run) REMOVE_APPLY=0 ;;
+      -*) die "Unknown remove flag: $1" ;;
+      *)
+        [ -z "$REMOVE_NAME" ] || die "Unexpected argument: $1"
+        REMOVE_NAME=$1
+        ;;
+    esac
+    shift
+  done
+
+  if [ "$REMOVE_PRUNE" = '1' ]; then
+    [ "$REMOVE_ALL" = '0' ] || die 'Use either remove --prune, remove --all, or remove <name>'
+    [ -z "$REMOVE_NAME" ] || die 'Use either remove --prune, remove --all, or remove <name>'
+    remove_stale "$REMOVE_APPLY"
+    return 0
+  fi
+
+  if [ "$REMOVE_ALL" = '1' ]; then
+    [ -z "$REMOVE_NAME" ] || die 'Use either remove <name> or remove --all'
+    remove_path "$ROUTER_HOME" "$REMOVE_APPLY"
+    remove_path "$PROFILE_DATA_BASE" "$REMOVE_APPLY"
+    return 0
+  fi
+
+  [ -n "$REMOVE_NAME" ] || die 'Usage: opencode-router remove <name> [--dry-run|--yes]'
+  profile_name_valid "$REMOVE_NAME" || die "Invalid profile name: $REMOVE_NAME"
+  remove_path "$(profile_env_path "$REMOVE_NAME")" "$REMOVE_APPLY"
+  remove_path "$(profile_home "$REMOVE_NAME")" "$REMOVE_APPLY"
+  remove_path "$(profile_data_root "$REMOVE_NAME")" "$REMOVE_APPLY"
+}
+
+CMD=${1-}
+
+# Dispatch subcommands, or treat unknown first args as routed OpenCode args.
+case "$CMD" in
+  '' ) run_auto ;;
+  run)
+    shift
+    run_auto "$@"
+    ;;
+  profile)
+    shift
+    [ "$#" -gt 0 ] || die 'Usage: opencode-router profile <name|default> [opencode args...]'
+    PROFILE_NAME=$1
+    shift
+    run_profile "$PROFILE_NAME" "$@"
+    ;;
+  which)
+    shift
+    cmd_which "$@"
+    ;;
+  new)
+    shift
+    cmd_new "$@"
+    ;;
+  list)
+    shift
+    cmd_list "$@"
+    ;;
+  show)
+    shift
+    cmd_show "$@"
+    ;;
+  remove)
+    shift
+    cmd_remove "$@"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    run_auto "$@"
+    ;;
+esac
