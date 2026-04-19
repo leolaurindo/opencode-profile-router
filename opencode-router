@@ -308,7 +308,7 @@ find_dir_flag() {
 # every existing directory-like positional arg as a project target.
 is_opencode_command() {
   case "$1" in
-    acp|agent|attach|completion|console|db|debug|export|generate|github|import|mcp|models|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
+    acp|agent|attach|auth|completion|console|db|debug|export|generate|github|import|mcp|models|plug|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
       return 0
       ;;
     *)
