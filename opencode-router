@@ -761,18 +761,14 @@ EOF
 # List configured profile names.
 cmd_list() {
   [ "$#" -eq 0 ] || die 'Usage: opencode-router list'
-  LIST_EMPTY=1
+  printf 'default\n'
   LIST_NAMES=$(list_profiles)
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    LIST_EMPTY=0
     printf '%s\n' "$name"
   done <<EOF
 $LIST_NAMES
 EOF
-  if [ "$LIST_EMPTY" = '1' ]; then
-    printf 'No profiles configured.\n'
-  fi
 }
 
 # Show one profile with its resolved paths, or print one specific path field.
