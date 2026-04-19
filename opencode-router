@@ -28,6 +28,22 @@ esac
 ROUTER_HOME="$CONFIG_HOME/opencode-router"
 PROFILES_DIR="$ROUTER_HOME/profiles"
 
+# IMPORTANT: OpenCode top-level command allowlist.
+#
+# Keep this in sync with `opencode --help` when upgrading OpenCode.
+# The router uses this list to distinguish real OpenCode subcommands from a
+# positional directory argument that should affect profile routing.
+is_opencode_command() {
+  case "$1" in
+    acp|agent|attach|auth|completion|console|db|debug|export|generate|github|import|mcp|models|plug|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Print top-level CLI usage.
 usage() {
   cat <<'EOF'
@@ -301,20 +317,6 @@ find_dir_flag() {
     shift
   done
   return 1
-}
-
-# Return success when the first arg is a real OpenCode subcommand.
-# This keeps routing close to OpenCode's own CLI behavior instead of treating
-# every existing directory-like positional arg as a project target.
-is_opencode_command() {
-  case "$1" in
-    acp|agent|attach|auth|completion|console|db|debug|export|generate|github|import|mcp|models|plug|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
 }
 
 # Infer which directory should drive routing for this invocation.
