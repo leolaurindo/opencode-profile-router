@@ -2,7 +2,7 @@
 
 `opencode-router` is an explicit wrapper around `opencode`.
 
-Tested with `opencode 1.3.17` and `1.4.3`.
+Compatible with the `opencode` version in `.opencode-version`.
 
 `work` will be used as the main "example" of a profile name. Whenever it shows, its a <profile-name>.
 

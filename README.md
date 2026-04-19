@@ -2,6 +2,8 @@
 
 Tiny profile wrapper for OpenCode.
 
+Compatible with the `opencode` version in `.opencode-version`.
+
 OpenCode supports custom config and data locations through environment variables, but it does not have a built-in profile system for multiple auth contexts from the same provider. For example, separate personal and work ChatGPT logins are not supported out of the box.
 
 `opencode-router` adds a lightweight profile layer on top of OpenCode. Each profile can have its own auth state, data root, and OpenCode config, with optional full config isolation when needed.
