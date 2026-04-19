@@ -43,6 +43,16 @@ echo 'alias ocr="opencode-router"' >> ~/.bashrc
 echo 'alias opr="opencode-router"' >> ~/.zshrc
 ```
 
+## Updating
+
+If you installed `opencode-router` from the recommended Git clone path above, update it with:
+
+```sh
+git -C "$HOME/.local/share/opencode-profile-router" pull --ff-only
+```
+
+`--ff-only` keeps the update predictable: it only moves your local clone forward when there are no divergent local commits, and refuses to create an automatic merge.
+
 ## Setup your first profile:
 
 ```sh
