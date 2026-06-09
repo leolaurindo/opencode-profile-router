@@ -29,7 +29,7 @@ Compatible with the `opencode` version in `.opencode-version`.
 | Command | Purpose |
 | --- | --- |
 | `opencode-router [opencode args...]` | Run OpenCode with automatic profile routing |
-| `opencode-router run [opencode args...]` | Explicit form of the default routed run |
+| `opencode-router run [message\|run flags...]` | Run OpenCode's `run` command with automatic profile routing |
 | `opencode-router profile <name\|default> [opencode args...]` | Force one profile, or plain OpenCode, for a single invocation |
 | `opencode-router which [--verbose] [opencode args...]` | Preview routing without launching OpenCode |
 | `opencode-router new [name] [path]` | Create a managed profile |
@@ -52,11 +52,12 @@ Run OpenCode with automatic profile routing.
 - If the first positional argument is an existing directory and not an OpenCode subcommand, that directory is used for routing.
 - If nothing matches, it runs plain `opencode`.
 
-### `opencode-router run [opencode args...]`
+### `opencode-router run [message|run flags...]`
 
-Explicit form of the default routed run.
+Run OpenCode's `run` command with automatic profile routing.
 
-Useful if you want the routing behavior to be obvious in a script or shell alias.
+For example, `opencode-router run -i` is passed through as `opencode run -i`.
+Bare `opencode-router run` is kept as an alias for `opencode-router`.
 
 ### `opencode-router profile <name|default> [opencode args...]`
 

@@ -68,7 +68,7 @@ See `DOCS.md` for commands, routing details, managed paths, config layering, and
 
 ## Intercepting `opencode`
 
-See `DOCS.md` or `opencode-router --help` to understand how opencode args are passed through.
+See `DOCS.md` or `opencode-router --help` to understand how opencode args are passed through. OpenCode's `run` command is passed through too, so `opencode-router run -i` executes `opencode run -i`.
 
 ```sh
 alias opencode="opencode-router"
