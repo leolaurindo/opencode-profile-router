@@ -10,7 +10,7 @@ OpenCode supports custom config and data locations through environment variables
 
 This is also useful when you want to use your company or team OpenCode setup, such as shared harnesses, skills, or tools, without interfering with your personal workflow. With full config isolation, a profile can behave like a separate global OpenCode setup.
 
-This is different from a project `.opencode/` setup. Project config is repo-scoped and discovered from the current directory up to the nearest Git root. It can override config for that project, but it does not provide separate provider login state by itself.
+This is different from a project `.opencode/` setup. V2 discovers project config from the current directory up to the filesystem root. It can override config for that project, but it does not provide separate provider login state by itself.
 
 With `opencode-router`, you can:
 
@@ -65,6 +65,15 @@ opencode-router "$HOME/work/my-repo"
 
 See `DOCS.md` for commands, routing details, managed paths, config layering, and shell setup.
 
+## OpenCode V2
+
+Profiles use private servers and always isolate `XDG_STATE_HOME` so the default
+background service cannot supply another profile's credentials. The router creates
+`service.json` with `disabled: true` in a profile if that file is missing; existing
+service settings are not overwritten. Plain/default invocations are unchanged.
+The old `OCR_USE_V2=1` selector still works, but now defaults to the installed
+`~/.opencode/bin/opencode`; `OPENCODE_V2_BIN` can override it.
+
 
 ## Intercepting `opencode`
 
@@ -88,9 +97,15 @@ You can bypass the wrapper with `command opencode` or by forcing `opencode profi
 
 Issues and pull requests are welcome.
 
+### Checks
+
+```sh
+sh -n opencode-router
+python3 -m unittest -v test_router.py
+```
+
 ### TODOs
 
-- add a regression script for the main routing and profile flows
 - add a script for automating the allowlist verification
 
 ## License

@@ -35,7 +35,7 @@ PROFILES_DIR="$ROUTER_HOME/profiles"
 # positional directory argument that should affect profile routing.
 is_opencode_command() {
   case "$1" in
-    acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plug|plugin|pr|providers|run|serve|session|stats|uninstall|upgrade|web)
+    acp|agent|api|attach|auth|completion|db|debug|export|github|import|mcp|mini|models|pair|plug|plugin|pr|providers|reload|run|serve|service|session|stats|uninstall|update|upgrade|web)
       return 0
       ;;
     *)
@@ -393,9 +393,34 @@ EOF
   printf '%s\n' "$MATCH_NAME"
 }
 
+# Keep the previous optional V2 selector, without pinning an obsolete binary.
+opencode_binary() {
+  if [ "${OCR_USE_V2:-0}" = '1' ]; then
+    printf '%s\n' "${OPENCODE_V2_BIN:-$HOME/.opencode/bin/opencode}"
+  else
+    command -v opencode
+  fi
+}
+
+# V2 replaces the global config directory. Link shared definitions into the
+# profile without overwriting its files; matching directories merge recursively.
+inherit_definitions() (
+  [ -d "$1" ] || exit 0
+  mkdir -p "$2"
+  for INHERIT_SOURCE in "$1"/*; do
+    [ -e "$INHERIT_SOURCE" ] || continue
+    INHERIT_TARGET="$2/${INHERIT_SOURCE##*/}"
+    if [ ! -e "$INHERIT_TARGET" ] && [ ! -L "$INHERIT_TARGET" ]; then
+      ln -s "$INHERIT_SOURCE" "$INHERIT_TARGET" 2>/dev/null || [ -e "$INHERIT_TARGET" ] || [ -L "$INHERIT_TARGET" ]
+    elif [ -d "$INHERIT_SOURCE" ] && [ -d "$INHERIT_TARGET" ] && [ ! -L "$INHERIT_TARGET" ]; then
+      inherit_definitions "$INHERIT_SOURCE" "$INHERIT_TARGET"
+    fi
+  done
+)
+
 # Run plain OpenCode without any profile overrides.
 run_default() {
-  exec opencode "$@"
+  exec "$(opencode_binary)" "$@"
 }
 
 # Run plain OpenCode while dropping router-managed overrides from the parent env.
@@ -417,7 +442,7 @@ run_default_forced() {
     case "${OPENCODE_CONFIG_DIR-}" in
       */opencode-router/profiles/*/config/opencode) unset OPENCODE_CONFIG_DIR ;;
     esac
-    exec opencode "$@"
+    exec "$(opencode_binary)" "$@"
   )
 }
 
@@ -446,10 +471,17 @@ EOF
   }
 
   (
+    RUN_BINARY=$(opencode_binary)
+    RUN_VERSION=$("$RUN_BINARY" --version)
+    RUN_V2=0
+    case "$RUN_VERSION" in
+      'opencode v2.'*|2.*) RUN_V2=1 ;;
+    esac
     # Keep profile-specific env changes scoped to this one OpenCode process.
     # Managed paths are derived from the profile name, not trusted from file data.
     [ -n "$OCR_XDG_DATA_HOME" ] && export XDG_DATA_HOME="$OCR_XDG_DATA_HOME"
-    if [ "$OCR_USE_STATE" != "0" ] && [ -n "$OCR_XDG_STATE_HOME" ]; then
+    # V2 discovers its background service in XDG_STATE_HOME, not XDG_DATA_HOME.
+    if [ "$RUN_V2" = '1' ] || [ "$OCR_USE_STATE" != "0" ]; then
       export XDG_STATE_HOME="$OCR_XDG_STATE_HOME"
     fi
     if [ "$OCR_FULL_CONFIG_ISOLATION" != "0" ] && [ -n "$OCR_XDG_CONFIG_HOME" ]; then
@@ -465,7 +497,49 @@ EOF
     else
       unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
     fi
-    exec opencode "$@"
+    if [ "$RUN_V2" = '1' ]; then
+      # All client commands (including auth and MCP) must avoid the default daemon.
+      mkdir -p "$(loaded_config_dir)"
+      export OPENCODE_CONFIG_DIR="$(loaded_config_dir)"
+      if [ "$OCR_FULL_CONFIG_ISOLATION" = '0' ]; then
+        RUN_SHARED_CONFIG="$(default_config_dir)/opencode.jsonc"
+        [ -f "$RUN_SHARED_CONFIG" ] || RUN_SHARED_CONFIG="$(default_config_dir)/opencode.json"
+        # The router's profile overrides are in opencode.jsonc, loaded last.
+        if [ -f "$RUN_SHARED_CONFIG" ] && [ ! -e "$OPENCODE_CONFIG_DIR/opencode.json" ] && [ ! -L "$OPENCODE_CONFIG_DIR/opencode.json" ]; then
+          ln -s "$RUN_SHARED_CONFIG" "$OPENCODE_CONFIG_DIR/opencode.json" 2>/dev/null || [ -e "$OPENCODE_CONFIG_DIR/opencode.json" ]
+        fi
+        for RUN_DEFINITIONS in agent agents command commands skill skills plugin plugins themes; do
+          inherit_definitions "$(default_config_dir)/$RUN_DEFINITIONS" "$OPENCODE_CONFIG_DIR/$RUN_DEFINITIONS"
+        done
+        if [ ! -e "$OPENCODE_CONFIG_DIR/AGENTS.md" ] && [ ! -L "$OPENCODE_CONFIG_DIR/AGENTS.md" ] && [ -f "$(default_config_dir)/AGENTS.md" ]; then
+          ln -s "$(default_config_dir)/AGENTS.md" "$OPENCODE_CONFIG_DIR/AGENTS.md" 2>/dev/null || [ -e "$OPENCODE_CONFIG_DIR/AGENTS.md" ]
+        fi
+      fi
+      if [ ! -f "$(loaded_config_dir)/service.json" ]; then
+        printf '{"disabled":true}\n' > "$(loaded_config_dir)/service.json"
+      fi
+      for RUN_ARG in "$@"; do
+        case "$RUN_ARG" in
+          --server|--server=*) exec "$RUN_BINARY" "$@" ;;
+        esac
+      done
+      # Explicit flags also work if the profile already has a service config.
+      case "${1-}" in
+        run|mini|api)
+          RUN_COMMAND=$1
+          shift
+          exec "$RUN_BINARY" "$RUN_COMMAND" --standalone "$@"
+          ;;
+        '') exec "$RUN_BINARY" --standalone ;;
+        -*) exec "$RUN_BINARY" --standalone "$@" ;;
+        *)
+          if ! is_opencode_command "$1"; then
+            exec "$RUN_BINARY" --standalone "$@"
+          fi
+          ;;
+      esac
+    fi
+    exec "$RUN_BINARY" "$@"
   )
 }
 
@@ -503,7 +577,7 @@ print_loaded_profile() {
   if [ "$OCR_USE_STATE" != "0" ] && [ -n "$OCR_XDG_STATE_HOME" ]; then
     printf 'XDG_STATE_HOME: %s\n' "$OCR_XDG_STATE_HOME"
   else
-    printf 'XDG_STATE_HOME: <unchanged>\n'
+    printf 'XDG_STATE_HOME: %s (V2; unchanged in V1)\n' "$OCR_XDG_STATE_HOME"
   fi
   if [ "$OCR_FULL_CONFIG_ISOLATION" != "0" ] && [ -n "$OCR_XDG_CONFIG_HOME" ]; then
     printf 'XDG_CONFIG_HOME: %s\n' "$OCR_XDG_CONFIG_HOME"
@@ -628,11 +702,11 @@ cmd_which() {
     WHICH_AUTH_FILE="$OCR_XDG_DATA_HOME/opencode/auth.json"
     print_loaded_profile
   fi
-  printf 'expected-auth-file: %s\n' "$WHICH_AUTH_FILE"
+  printf 'legacy-auth-file: %s\n' "$WHICH_AUTH_FILE"
   if [ -f "$WHICH_AUTH_FILE" ]; then
-    printf 'expected-auth-file-exists: yes\n'
+    printf 'legacy-auth-file-exists: yes\n'
   else
-    printf 'expected-auth-file-exists: no\n'
+    printf 'legacy-auth-file-exists: no\n'
   fi
 }
 

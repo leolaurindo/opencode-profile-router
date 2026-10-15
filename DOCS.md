@@ -45,12 +45,25 @@ Compatible with the `opencode` version in `.opencode-version`.
 Run OpenCode with automatic profile routing.
 
 - If a profile matches, `XDG_DATA_HOME` is overridden for that process.
-- If the profile enables state isolation, `XDG_STATE_HOME` is also overridden.
+- In V2, `XDG_STATE_HOME` is always overridden because it controls service discovery.
+  V1 only overrides it when the profile enables state isolation.
 - By default, if the profile has config files or a config dir, `OPENCODE_CONFIG_DIR` is set for that process.
 - `OPENCODE_CONFIG` is only set when the profile's `opencode.jsonc` file exists.
 - With full config isolation, `XDG_CONFIG_HOME` is set for that profile instead.
 - If the first positional argument is an existing directory and not an OpenCode subcommand, that directory is used for routing.
 - If nothing matches, it runs plain `opencode`.
+- V2 profile TUI, `run`, `mini`, and `api` launches use `--standalone`.
+  A missing profile `service.json` is initialized with `disabled: true` so other
+  client commands also use private servers. Existing service settings are kept.
+  Do not enable a managed profile service on the default service's port.
+- V2 replaces the global config directory rather than layering it. For profiles
+  without full isolation, the router links the shared config as `opencode.json`
+  (profile `opencode.jsonc` wins), and links missing shared agent, command, skill,
+  plugin and theme definitions. Profile files are never overwritten. Shared
+  files remain live links, not copies. Keep profile overrides in `opencode.jsonc`;
+  an existing profile `opencode.json` takes precedence over creating this link.
+  A profile's own `AGENTS.md` replaces the shared file; include any shared guidance
+  there when needed. Full-isolation profiles do not receive shared links.
 
 ### `opencode-router run [message|run flags...]`
 
